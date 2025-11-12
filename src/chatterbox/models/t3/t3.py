@@ -48,6 +48,13 @@ class T3(nn.Module):
         self.hp = hp
         self.cfg = LlamaConfig(**LLAMA_CONFIGS[hp.llama_config_name])
         self.tfmr = LlamaModel(self.cfg)
+        if hasattr(self.tfmr, "set_attn_implementation"):
+            self.tfmr.set_attn_implementation("eager")
+        if hasattr(self.tfmr, "config"):
+            self.tfmr.config.attn_implementation = "eager"
+        #torch.backends.cuda.enable_flash_sdp(False)
+        #torch.backends.cuda.enable_mem_efficient_sdp(False)
+        #torch.backends.cuda.enable_math_sdp(True)
         self.dim = self.cfg.hidden_size
         self.deepspeed_patch_applied = False
 
@@ -206,7 +213,7 @@ class T3(nn.Module):
         return loss_text, loss_speech
 
     @torch.inference_mode()
-    def inference(
+    def inference_generator(
         self,
         *,
         t3_cond: T3Cond,
@@ -310,7 +317,6 @@ class T3(nn.Module):
 
         # Track generated token ids; start with the BOS token.
         generated_ids = bos_token.clone()
-        predicted = []  # To store the predicted tokens
 
         # Instantiate the logits processors.
         top_p_warper = TopPLogitsWarper(top_p=top_p)
@@ -363,7 +369,7 @@ class T3(nn.Module):
             probs = torch.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)  # shape: (B, 1)
 
-            predicted.append(next_token)
+            yield next_token
             generated_ids = torch.cat([generated_ids, next_token], dim=1)
 
             # Check for EOS token.
@@ -389,6 +395,9 @@ class T3(nn.Module):
             # Update the kv_cache.
             past = output.past_key_values
 
+    @torch.inference_mode()
+    def inference(self, *args, **kwargs):
+        predicted = [x for x in self.inference_generator(*args, **kwargs)]
         # Concatenate all predicted tokens along the sequence dimension.
         predicted_tokens = torch.cat(predicted, dim=1)  # shape: (B, num_tokens)
         return predicted_tokens
