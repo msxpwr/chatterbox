@@ -299,3 +299,119 @@ class ChatterboxMultilingualTTS:
             wav = wav.squeeze(0).detach().cpu().numpy()
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
+
+    def _pack_speech_tokens(self, gen, packsize=50):
+        pack = []
+        for token in gen:
+            pack.append(token)
+            if len(pack) >= (packsize+3):
+                yield torch.cat(pack[:(packsize+3)], dim=1), False
+                pack = pack[packsize:]
+        pack.append(torch.zeros(1,0, dtype=torch.int64).to(self.device))
+        yield torch.cat(pack, dim=1), True
+
+    def _pack_speech_mels(self, gen, reflen=150, overlap=15):
+        mel_refs = {}
+        mel_refs['prompt_token'] = self.conds.gen['prompt_token'][:,-(reflen):]
+        mel_refs['prompt_token_len'] = torch.tensor([mel_refs['prompt_token'].size(1)], dtype=torch.int32).to(self.conds.gen['prompt_token'].device)
+        mel_refs['prompt_feat'] = self.conds.gen['prompt_feat'][:, -(reflen*2):]
+        mel_refs['prompt_feat_len'] = None
+        mel_refs['embedding'] = self.conds.gen['embedding']
+
+        for token_pack, final_pack in gen:
+            # Extract only the conditional batch.
+            speech_tokens = token_pack[0]
+
+            # TODO: output becomes 1D
+            speech_tokens = drop_invalid_tokens(speech_tokens)
+            speech_tokens = speech_tokens.to(self.device)
+            mels = self.s3gen.flow_inference(speech_tokens, ref_dict=mel_refs, finalize=final_pack)
+            yield mels, final_pack
+            if not final_pack:
+                mel_refs['prompt_token'] = torch.cat([self.conds.gen['prompt_token'][:, -(reflen):], torch.unsqueeze(speech_tokens[-(overlap):], dim=0)], dim=1)
+                mel_refs['prompt_token_len'] = torch.tensor([mel_refs['prompt_token'].size(1)], dtype=torch.int32).to(self.conds.gen['prompt_token'].device)
+                mel_refs['prompt_feat'] = torch.cat([self.conds.gen['prompt_feat'][:, -(reflen*2):], torch.transpose(mels[:, :, -(overlap*2):], 1,2)], dim=1)
+
+    def _pack_speech_wavs(self, gen, left_exp_hift=10, left_exp=5, packsize=50, right_exp=10):
+        last_mels = torch.zeros(1, 80, 0).to(self.device)
+        last_hift = torch.zeros(1, 1, 0).to(self.device)
+        mels = torch.zeros(1, 80, 0).to(self.device)
+        for mel_pack, final in gen:
+            mels = torch.cat([mels, mel_pack], dim=2)
+            if mels.shape[2] >= (packsize+right_exp):
+                toproc_new = mels[:, :, :(packsize+right_exp)]
+                toproc_old = last_mels[:, :, -(left_exp_hift+left_exp):]
+                mels = mels[:, :, (packsize):]
+                toproc = torch.cat([toproc_old, toproc_new], dim=2)
+                toproc_hift = last_hift[:, :, -(480*(left_exp_hift+left_exp)):-(480*left_exp)]
+                wav_frag, src_frag = self.s3gen.hift_inference(toproc, toproc_hift)
+                yield wav_frag[:, (480*(toproc_old.shape[2])):-(480*right_exp)], False
+                last_mels = toproc[:,:,:-(right_exp)]
+                last_hift = src_frag[:,:,:-(480*right_exp)]
+        toproc_old = last_mels[:, :, -(left_exp_hift+left_exp):]
+        toproc = torch.cat([toproc_old, mels], dim=2)
+        toproc_hift = last_hift[:, :, -(480*(left_exp_hift+left_exp)):-(480*left_exp)]
+        wav_frag, _ = self.s3gen.hift_inference(toproc, toproc_hift)
+        yield wav_frag[:, (480*(toproc_old.shape[2])):], True
+
+    def generate_stream(
+        self,
+        text,
+        language_id,
+        audio_prompt_path=None,
+        exaggeration=0.5,
+        cfg_weight=0.5,
+        temperature=0.8,
+        repetition_penalty=2.0,
+        min_p=0.05,
+        top_p=1.0,
+    ):
+        # Validate language_id
+        if language_id and language_id.lower() not in SUPPORTED_LANGUAGES:
+            supported_langs = ", ".join(SUPPORTED_LANGUAGES.keys())
+            raise ValueError(
+                f"Unsupported language_id '{language_id}'. "
+                f"Supported languages: {supported_langs}"
+            )
+        
+        if audio_prompt_path:
+            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+        else:
+            assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+
+        # Update exaggeration if needed
+        if float(exaggeration) != float(self.conds.t3.emotion_adv[0, 0, 0].item()):
+            _cond: T3Cond = self.conds.t3
+            self.conds.t3 = T3Cond(
+                speaker_emb=_cond.speaker_emb,
+                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
+                emotion_adv=exaggeration * torch.ones(1, 1, 1),
+            ).to(device=self.device)
+
+        # Norm and tokenize text
+        text = punc_norm(text)
+        text_tokens = self.tokenizer.text_to_tokens(text, language_id=language_id.lower() if language_id else None).to(self.device)
+        text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # Need two seqs for CFG
+
+        sot = self.t3.hp.start_text_token
+        eot = self.t3.hp.stop_text_token
+        text_tokens = F.pad(text_tokens, (1, 0), value=sot)
+        text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+
+        with torch.inference_mode():
+            speech_tokens_generator = self.t3.inference_generator(
+                t3_cond=self.conds.t3,
+                text_tokens=text_tokens,
+                max_new_tokens=1000,  # TODO: use the value in config
+                temperature=temperature,
+                cfg_weight=cfg_weight,
+                repetition_penalty=repetition_penalty,
+                min_p=min_p,
+                top_p=top_p,
+            )
+            speech_pack_gen = self._pack_speech_tokens(speech_tokens_generator, packsize=50)
+            speech_mel_gen = self._pack_speech_mels(speech_pack_gen, reflen=99999, overlap=5)
+            speech_wav_gen = self._pack_speech_wavs(speech_mel_gen)
+            
+            for wav_frag, final_pack in speech_wav_gen:
+                yield wav_frag
